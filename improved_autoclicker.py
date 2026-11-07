@@ -101,12 +101,12 @@ def save_config(config):
 
 def startup_command():
     if getattr(sys, "frozen", False):
-        return f'"{sys.executable}"'
+        return f'"{sys.executable}" --minimized'
     executable = sys.executable
     pythonw = os.path.join(os.path.dirname(executable), "pythonw.exe")
     launcher = pythonw if os.path.isfile(pythonw) else executable
     script = os.path.abspath(__file__)
-    return f'"{launcher}" "{script}"'
+    return f'"{launcher}" "{script}" --minimized'
 
 
 def read_startup_command():
@@ -328,6 +328,7 @@ class AutoClickerApp:
         self._hotkey = ""
         self._hotkey_handle = None
         self._committing_hotkey = False
+        self._hotkey_capturing = False
         self._last_toggle = 0.0
         self._last_valid_ms = DEFAULT_CONFIG["interval_milliseconds"]
         self._save_job = None
@@ -521,6 +522,15 @@ class AutoClickerApp:
         )
         self.startup_check.grid(row=4, column=0, sticky="w", pady=(10, 0))
 
+        self.toggle_button = ttk.Button(
+            container,
+            text="Start",
+            style="Flat.TButton",
+            cursor="hand2",
+            command=self._toggle_clicking,
+        )
+        self.toggle_button.grid(row=5, column=0, sticky="ew", pady=(18, 0))
+
         self.tray_button = ttk.Button(
             container,
             text="Minimize to Tray",
@@ -528,7 +538,7 @@ class AutoClickerApp:
             cursor="hand2",
             command=self._minimize_to_tray,
         )
-        self.tray_button.grid(row=5, column=0, sticky="ew", pady=(18, 0))
+        self.tray_button.grid(row=6, column=0, sticky="ew", pady=(8, 0))
 
         self.seconds_var.trace_add("write", self._on_interval_changed)
         self.ms_var.trace_add("write", self._on_interval_changed)
@@ -538,9 +548,9 @@ class AutoClickerApp:
             entry.bind("<FocusOut>", self._commit_interval)
             entry.bind("<FocusIn>", lambda event: event.widget.select_range(0, "end"))
 
-        self.hotkey_entry.bind("<Return>", self._commit_hotkey)
-        self.hotkey_entry.bind("<FocusOut>", self._commit_hotkey)
-        self.hotkey_entry.bind("<Escape>", self._restore_hotkey_field)
+        self.hotkey_entry.bind("<FocusIn>", self._begin_hotkey_capture)
+        self.hotkey_entry.bind("<Button-1>", self._begin_hotkey_capture)
+        self.hotkey_entry.bind("<FocusOut>", self._cancel_hotkey_capture)
 
     def _finalize_window(self):
         self.root.update_idletasks()
@@ -694,43 +704,74 @@ class AutoClickerApp:
             self._bind_hotkey(DEFAULT_HOTKEY)
         self.hotkey_var.set(format_hotkey(self._hotkey or DEFAULT_HOTKEY))
 
-    def _commit_hotkey(self, event=None):
-        if self._closed or self._committing_hotkey:
+    def _begin_hotkey_capture(self, _event=None):
+        if self._closed or self._hotkey_capturing:
             return "break"
-        self._committing_hotkey = True
-        try:
-            try:
-                combo = normalize_hotkey(self.hotkey_var.get())
-            except ValueError:
-                combo = None
-            if combo is None:
-                self.hotkey_var.set(format_hotkey(self._hotkey or DEFAULT_HOTKEY))
-                if event is not None and getattr(event, "keysym", "") == "Return":
-                    messagebox.showerror(
-                        APP_NAME,
-                        "Enter a valid key such as F6, or a combination like Ctrl+Alt+K.",
-                        parent=self.root,
-                    )
-                return "break"
-            self.hotkey_var.set(format_hotkey(combo))
-            if combo != self._hotkey:
-                if not self._bind_hotkey(combo):
-                    self.hotkey_var.set(format_hotkey(self._hotkey or DEFAULT_HOTKEY))
-                    messagebox.showerror(
-                        APP_NAME,
-                        "That hotkey could not be registered. Try a different key.",
-                        parent=self.root,
-                    )
-                    return "break"
-                self._persist()
-        finally:
-            self._committing_hotkey = False
+        self._hotkey_capturing = True
+        self._unbind_hotkey()
+        self.hotkey_var.set("")
+        self.hotkey_entry.configure(state="readonly")
+        threading.Thread(
+            target=self._hotkey_capture_worker, name="HotkeyCapture", daemon=True
+        ).start()
         return "break"
 
-    def _restore_hotkey_field(self, _event=None):
+    def _hotkey_capture_worker(self):
+        try:
+            combo = keyboard.read_hotkey(suppress=False)
+        except Exception:
+            combo = None
+        self._queue.put(("hotkey", combo))
+
+    def _cancel_hotkey_capture(self, _event=None):
+        if not self._hotkey_capturing or self._closed:
+            return
+        # Focus moved away before capture completed; restore display and rebind.
+        # The capture thread may still be waiting for a keypress; it will post a
+        # result that _finish_hotkey_capture will ignore once capture ends.
+        self._hotkey_capturing = False
+        try:
+            self.hotkey_entry.configure(state="normal")
+        except tk.TclError:
+            return
         self.hotkey_var.set(format_hotkey(self._hotkey or DEFAULT_HOTKEY))
+        if self._hotkey and self._hotkey_handle is None:
+            self._bind_hotkey(self._hotkey)
+
+    def _finish_hotkey_capture(self, combo):
+        if not self._hotkey_capturing or self._closed:
+            return
+        self._hotkey_capturing = False
+        try:
+            self.hotkey_entry.configure(state="normal")
+        except tk.TclError:
+            return
+
+        if not combo or str(combo).strip().lower() == "esc":
+            self.hotkey_var.set(format_hotkey(self._hotkey or DEFAULT_HOTKEY))
+            if self._hotkey and self._hotkey_handle is None:
+                self._bind_hotkey(self._hotkey)
+            return
+
+        try:
+            normalized = normalize_hotkey(combo)
+        except ValueError:
+            normalized = None
+
+        if normalized is None or not self._bind_hotkey(normalized):
+            self.hotkey_var.set(format_hotkey(self._hotkey or DEFAULT_HOTKEY))
+            if self._hotkey and self._hotkey_handle is None:
+                self._bind_hotkey(self._hotkey)
+            messagebox.showerror(
+                APP_NAME,
+                "That hotkey could not be registered. Try a different key.",
+                parent=self.root,
+            )
+            return
+
+        self.hotkey_var.set(format_hotkey(self._hotkey))
+        self._persist()
         self.root.focus_set()
-        return "break"
 
     def _on_hotkey_press(self):
         if self._closed:
@@ -741,6 +782,16 @@ class AutoClickerApp:
         self._last_toggle = now
         running = self.engine.toggle()
         self._queue.put(("state", running))
+
+    def _toggle_clicking(self):
+        if self._closed:
+            return
+        now = time.monotonic()
+        if now - self._last_toggle < 0.3:
+            return
+        self._last_toggle = now
+        running = self.engine.toggle()
+        self._apply_running_state(running, notify=True)
 
     def _build_tray(self):
         self._tray_icons = {
@@ -773,6 +824,12 @@ class AutoClickerApp:
             self.root.title(f"{APP_NAME} - Clicking" if running else APP_NAME)
         except tk.TclError:
             return
+        toggle = getattr(self, "toggle_button", None)
+        if toggle is not None:
+            try:
+                toggle.configure(text="Stop" if running else "Start")
+            except tk.TclError:
+                pass
         icon = self.icon
         if icon is not None:
             try:
@@ -790,7 +847,6 @@ class AutoClickerApp:
             toast.overrideredirect(True)
             toast.configure(bg=BG)
             toast.attributes("-topmost", True)
-            toast.attributes("-alpha", 1.0)
             panel = tk.Frame(toast, bg=SURFACE, padx=20, pady=12)
             panel.pack(fill="both", expand=True)
             message = "Autoclicker Enabled" if enabled else "Autoclicker Disabled"
@@ -810,9 +866,7 @@ class AutoClickerApp:
             toast.deiconify()
             toast.lift()
             self._toast = toast
-            self._toast_job = self.root.after(
-                1000, lambda: self._fade_notification(toast, 1.0)
-            )
+            self._toast_job = self.root.after(1500, self._destroy_notification)
         except tk.TclError:
             self._destroy_notification()
 
@@ -885,6 +939,8 @@ class AutoClickerApp:
                 if isinstance(item, tuple):
                     if item[0] == "state":
                         self._apply_running_state(bool(item[1]), notify=True)
+                    elif item[0] == "hotkey":
+                        self._finish_hotkey_capture(item[1])
                     continue
                 if item == "open":
                     self._restore_window()
@@ -947,6 +1003,9 @@ def main():
     config = reconcile_startup(load_config())
     engine = ClickEngine()
     root = tk.Tk()
+    start_minimized = "--minimized" in sys.argv
+    if start_minimized:
+        root.withdraw()
     app = AutoClickerApp(root, config, engine)
     try:
         root.mainloop()
