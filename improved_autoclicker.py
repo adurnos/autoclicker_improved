@@ -726,9 +726,6 @@ class AutoClickerApp:
     def _cancel_hotkey_capture(self, _event=None):
         if not self._hotkey_capturing or self._closed:
             return
-        # Focus moved away before capture completed; restore display and rebind.
-        # The capture thread may still be waiting for a keypress; it will post a
-        # result that _finish_hotkey_capture will ignore once capture ends.
         self._hotkey_capturing = False
         try:
             self.hotkey_entry.configure(state="normal")
@@ -867,23 +864,6 @@ class AutoClickerApp:
             toast.lift()
             self._toast = toast
             self._toast_job = self.root.after(1500, self._destroy_notification)
-        except tk.TclError:
-            self._destroy_notification()
-
-    def _fade_notification(self, toast, alpha):
-        if toast is not self._toast:
-            return
-        try:
-            if not toast.winfo_exists():
-                return
-            alpha -= 0.08
-            if alpha <= 0:
-                self._destroy_notification()
-                return
-            toast.attributes("-alpha", alpha)
-            self._toast_job = self.root.after(
-                32, lambda: self._fade_notification(toast, alpha)
-            )
         except tk.TclError:
             self._destroy_notification()
 
