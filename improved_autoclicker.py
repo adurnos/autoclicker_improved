@@ -1,5 +1,6 @@
 import ctypes
 import json
+import logging
 import os
 import queue
 import random
@@ -9,10 +10,20 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
 import keyboard
 import pystray
 from PIL import Image, ImageDraw, ImageTk
 from pystray import Menu, MenuItem
+
+try:
+    import winsound
+except ImportError:
+    winsound = None
 
 try:
     import winreg
@@ -21,8 +32,9 @@ except ImportError:
 
 APP_NAME = "Improved AutoClicker"
 APP_ID = "ImprovedAutoClicker"
-CONFIG_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), APP_ID)
+CONFIG_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), APP_ID)
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+LOG_PATH = os.path.join(CONFIG_DIR, "autoclicker.log")
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE = APP_ID
 DEFAULT_HOTKEY = "f6"
@@ -32,13 +44,133 @@ DEFAULT_CONFIG = {
     "interval_milliseconds": 100,
     "hotkey": DEFAULT_HOTKEY,
     "randomize": False,
-    "startup": False,
 }
 
-MIN_INTERVAL_MS = 1
-MAX_INTERVAL_MS = 24 * 60 * 60 * 1000
+MIN_INTERVAL_MS = 10
+MAX_INTERVAL_SECONDS = 9999
+MAX_INTERVAL_MS = MAX_INTERVAL_SECONDS * 1000 + 999
+SECONDS_DIGITS = 4
+MILLISECONDS_DIGITS = 3
+MAX_CLICK_FAILURES = 5
+HOTKEY_POLL_MS = 25
 JITTER_LOW = 0.8
 JITTER_HIGH = 1.2
+
+MODIFIER_KEYS = {
+    "ctrl",
+    "left ctrl",
+    "right ctrl",
+    "shift",
+    "left shift",
+    "right shift",
+    "alt",
+    "left alt",
+    "right alt",
+    "alt gr",
+    "windows",
+    "left windows",
+    "right windows",
+    "cmd",
+}
+
+VK_GROUPS = {
+    "ctrl": (0xA2, 0xA3),
+    "left ctrl": (0xA2,),
+    "right ctrl": (0xA3,),
+    "shift": (0xA0, 0xA1),
+    "left shift": (0xA0,),
+    "right shift": (0xA1,),
+    "alt": (0xA4, 0xA5),
+    "left alt": (0xA4,),
+    "right alt": (0xA5,),
+    "alt gr": (0xA5,),
+    "windows": (0x5B, 0x5C),
+    "win": (0x5B, 0x5C),
+    "cmd": (0x5B, 0x5C),
+    "left windows": (0x5B,),
+    "right windows": (0x5C,),
+    "space": (0x20,),
+    "tab": (0x09,),
+    "enter": (0x0D,),
+    "return": (0x0D,),
+    "esc": (0x1B,),
+    "escape": (0x1B,),
+    "backspace": (0x08,),
+    "delete": (0x2E,),
+    "insert": (0x2D,),
+    "home": (0x24,),
+    "end": (0x23,),
+    "page up": (0x21,),
+    "page down": (0x22,),
+    "up": (0x26,),
+    "down": (0x28,),
+    "left": (0x25,),
+    "right": (0x27,),
+    "print screen": (0x2C,),
+    "pause": (0x13,),
+    "caps lock": (0x14,),
+    "minus": (0xBD,),
+    "-": (0xBD,),
+    "plus": (0xBB,),
+    "+": (0xBB,),
+    "=": (0xBB,),
+    "comma": (0xBC,),
+    ",": (0xBC,),
+    "period": (0xBE,),
+    ".": (0xBE,),
+    "slash": (0xBF,),
+    "/": (0xBF,),
+    "backslash": (0xDC,),
+    "\\": (0xDC,),
+    "semicolon": (0xBA,),
+    ";": (0xBA,),
+    "quote": (0xDE,),
+    "'": (0xDE,),
+    "backquote": (0xC0,),
+    "`": (0xC0,),
+    "left bracket": (0xDB,),
+    "[": (0xDB,),
+    "right bracket": (0xDD,),
+    "]": (0xDD,),
+}
+
+
+def combo_keys(combo):
+    text = str(combo).strip().lower()
+    keys = [part.strip() for part in text.split("+") if part.strip()]
+    if text.endswith("+"):
+        keys.append("+")
+    return keys
+
+
+def vk_group(name):
+    group = VK_GROUPS.get(name)
+    if group is not None:
+        return group
+    if len(name) == 1 and name.isascii():
+        if "a" <= name <= "z" or "0" <= name <= "9":
+            return (ord(name.upper()),)
+    if len(name) > 1 and name[0] == "f" and name[1:].isascii() and name[1:].isdigit():
+        number = int(name[1:])
+        if 1 <= number <= 24:
+            return (0x70 + number - 1,)
+    return ()
+
+
+def hotkey_vk_groups(combo):
+    groups = []
+    for name in combo_keys(combo):
+        group = vk_group(name)
+        if not group:
+            raise ValueError(f"Unsupported key in hotkey: {name!r}")
+        groups.append(tuple(group))
+    if not groups:
+        raise ValueError("The hotkey is empty")
+    return tuple(groups)
+
+
+def _vk_down(vk):
+    return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
 
 BG = "#000000"
 SURFACE = "#1e1e1e"
@@ -47,6 +179,32 @@ TEXT = "#ffffff"
 MUTED = "#d3d3d3"
 
 RESAMPLE = getattr(Image, "Resampling", Image).LANCZOS
+
+log = logging.getLogger(APP_ID)
+
+
+def report_callback_exception(exception_type, error, traceback_object):
+    log.error(
+        "Unhandled interface error",
+        exc_info=(exception_type, error, traceback_object),
+    )
+
+
+def setup_logging():
+    log.setLevel(logging.INFO)
+    if log.handlers:
+        return
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        if os.path.isfile(LOG_PATH) and os.path.getsize(LOG_PATH) > 512 * 1024:
+            os.remove(LOG_PATH)
+        handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+        )
+        log.addHandler(handler)
+    except OSError:
+        log.addHandler(logging.NullHandler())
 
 
 def _as_int(value, fallback):
@@ -61,17 +219,29 @@ def normalize_config(raw):
         raw = {}
     config = dict(DEFAULT_CONFIG)
     config["interval_seconds"] = max(
-        0, min(9999, _as_int(raw.get("interval_seconds"), config["interval_seconds"]))
+        0,
+        min(
+            MAX_INTERVAL_SECONDS,
+            _as_int(raw.get("interval_seconds"), config["interval_seconds"]),
+        ),
     )
     config["interval_milliseconds"] = max(
         0,
-        min(999, _as_int(raw.get("interval_milliseconds"), config["interval_milliseconds"])),
+        min(
+            999,
+            _as_int(
+                raw.get("interval_milliseconds"),
+                config["interval_milliseconds"],
+            ),
+        ),
     )
+    total = config["interval_seconds"] * 1000 + config["interval_milliseconds"]
+    total = max(MIN_INTERVAL_MS, min(MAX_INTERVAL_MS, total))
+    config["interval_seconds"], config["interval_milliseconds"] = divmod(total, 1000)
     hotkey = raw.get("hotkey")
     if isinstance(hotkey, str) and hotkey.strip():
         config["hotkey"] = hotkey.strip().lower()
     config["randomize"] = raw.get("randomize") is True
-    config["startup"] = raw.get("startup") is True
     return config
 
 
@@ -83,7 +253,8 @@ def load_config():
         config = dict(DEFAULT_CONFIG)
         save_config(config)
         return config
-    except (OSError, ValueError):
+    except (OSError, ValueError) as error:
+        log.warning("Could not read the saved settings: %s", error)
         return dict(DEFAULT_CONFIG)
 
 
@@ -95,86 +266,175 @@ def save_config(config):
             json.dump(config, handle, indent=2)
         os.replace(temporary, CONFIG_PATH)
         return True
-    except OSError:
+    except OSError as error:
+        log.warning("Could not save the settings: %s", error)
         return False
 
 
-def startup_command():
-    if getattr(sys, "frozen", False):
-        return f'"{sys.executable}" --minimized'
-    executable = sys.executable
-    pythonw = os.path.join(os.path.dirname(executable), "pythonw.exe")
-    launcher = pythonw if os.path.isfile(pythonw) else executable
-    script = os.path.abspath(__file__)
-    return f'"{launcher}" "{script}" --minimized'
-
-
-def read_startup_command():
+def remove_legacy_startup():
     if winreg is None:
-        return None
+        return
     try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_READ) as key:
-            value, _ = winreg.QueryValueEx(key, RUN_VALUE)
-            return str(value)
-    except OSError:
-        return None
-
-
-def set_startup(enabled):
-    if winreg is None:
-        return False
-    try:
-        if enabled:
-            with winreg.CreateKeyEx(
-                winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE
-            ) as key:
-                winreg.SetValueEx(key, RUN_VALUE, 0, winreg.REG_SZ, startup_command())
-        else:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_READ | winreg.KEY_SET_VALUE
+        ) as key:
             try:
-                with winreg.OpenKey(
-                    winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE
-                ) as key:
-                    winreg.DeleteValue(key, RUN_VALUE)
+                winreg.QueryValueEx(key, RUN_VALUE)
             except FileNotFoundError:
-                pass
-        return True
-    except OSError:
-        return False
-
-
-def reconcile_startup(config):
-    if config.get("startup") is True and read_startup_command() != startup_command():
-        if not set_startup(True):
-            config["startup"] = False
-            save_config(config)
-    return config
+                return
+            winreg.DeleteValue(key, RUN_VALUE)
+            log.info("Removed the old Windows startup entry")
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        log.warning("Could not remove the old startup entry: %s", error)
 
 
 def normalize_hotkey(text):
-    combo = str(text).strip().lower().replace(" ", "")
-    if not combo:
+    combo = "+".join(part.strip() for part in str(text).strip().lower().split("+"))
+    parts = [part for part in combo.split("+") if part]
+    if not parts:
         raise ValueError("empty hotkey")
-    if "+" not in combo and len(combo) < 2:
+    if len(parts) == 1 and len(parts[0]) == 1:
         raise ValueError("single-character hotkeys are not allowed")
+    if all(part in MODIFIER_KEYS for part in parts):
+        raise ValueError("a hotkey needs a key that is not a modifier")
     keyboard.parse_hotkey(combo)
+    hotkey_vk_groups(combo)
     return combo
 
 
 def format_hotkey(combo):
     if not combo:
         return ""
-    return "+".join(
-        part.upper() if len(part) == 1 else part.capitalize() for part in combo.split("+")
-    )
+    parts = []
+    for part in combo.split("+"):
+        if len(part) == 1:
+            parts.append(part.upper())
+        else:
+            parts.append(" ".join(word.capitalize() for word in part.split()))
+    return "+".join(parts)
+
+
+def capture_hotkey(cancel):
+    pressed = []
+    result = []
+    finished = threading.Event()
+
+    def on_event(event):
+        if cancel.is_set() or finished.is_set():
+            return
+        name = event.name
+        if name == "esc":
+            finished.set()
+            return
+        if event.event_type == keyboard.KEY_DOWN:
+            if name not in pressed:
+                pressed.append(name)
+            return
+        if event.event_type != keyboard.KEY_UP:
+            return
+        held = [key for key in pressed if key != name]
+        pressed[:] = held
+        try:
+            combo = keyboard.get_hotkey_name(held + [name])
+        except Exception:
+            log.debug("Could not read the captured keys", exc_info=True)
+            return
+        parts = [part for part in combo.split("+") if part]
+        if parts and all(part in MODIFIER_KEYS for part in parts):
+            return
+        result.append(combo)
+        finished.set()
+
+    handle = keyboard.hook(on_event)
+    try:
+        while not finished.is_set():
+            if cancel.wait(0.05):
+                return None
+        return result[0] if result else None
+    finally:
+        try:
+            keyboard.unhook(handle)
+        except Exception:
+            log.debug("Could not remove the capture hook", exc_info=True)
+
+
+class HotkeyPoller:
+    def __init__(self, on_fire):
+        self._on_fire = on_fire
+        self._groups = ()
+        self._armed = True
+        self._suspended = False
+        self._lock = threading.Lock()
+
+    def is_pressed(self):
+        groups = self._groups
+        if not groups:
+            return False
+        return all(any(_vk_down(vk) for vk in group) for group in groups)
+
+    def set_combo(self, combo):
+        try:
+            groups = hotkey_vk_groups(combo)
+        except Exception as error:
+            log.warning("Cannot watch the hotkey %r: %s", combo, error)
+            return False
+        with self._lock:
+            self._groups = groups
+            self._armed = True
+        try:
+            if self.is_pressed():
+                self._armed = False
+        except Exception:
+            log.debug("Could not read the initial key state", exc_info=True)
+        log.info("Hotkey %r is armed (virtual keys %s)", combo, groups)
+        return True
+
+    def clear(self):
+        with self._lock:
+            self._groups = ()
+            self._armed = True
+
+    def set_suspended(self, value):
+        self._suspended = bool(value)
+        if not value:
+            self._armed = True
+
+    def poll(self):
+        if self._suspended:
+            return
+        if not self._groups:
+            return
+        try:
+            pressed = self.is_pressed()
+        except Exception:
+            log.exception("Could not check the keyboard state")
+            return
+        with self._lock:
+            if pressed:
+                fire = self._armed
+                self._armed = False
+            else:
+                self._armed = True
+                fire = False
+        if not fire:
+            return
+        try:
+            self._on_fire()
+        except Exception:
+            log.exception("The hotkey action failed")
 
 
 class ClickEngine:
     def __init__(self):
-        self._lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._config_lock = threading.Lock()
         self._interval = DEFAULT_CONFIG["interval_milliseconds"] / 1000.0
         self._randomize = False
         self._stop = threading.Event()
         self._thread = None
+        self.report = None
 
     @property
     def running(self):
@@ -182,54 +442,54 @@ class ClickEngine:
         return thread is not None and thread.is_alive()
 
     def configure(self, interval_seconds, randomize):
-        with self._lock:
-            self._interval = max(MIN_INTERVAL_MS / 1000.0, float(interval_seconds))
+        with self._config_lock:
+            self._interval = min(
+                MAX_INTERVAL_MS / 1000.0,
+                max(MIN_INTERVAL_MS / 1000.0, float(interval_seconds)),
+            )
             self._randomize = bool(randomize)
 
-    def start(self):
-        if self.running:
-            return True
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="ClickEngine", daemon=True)
-        self._thread.start()
-        return True
-
     def stop(self):
-        self._stop.set()
-        thread = self._thread
-        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=1.0)
-        self._thread = None
+        with self._state_lock:
+            self._stop.set()
+            self._thread = None
 
     def toggle(self):
-        if self.running:
-            self.stop()
-            return False
-        self.start()
-        return True
+        with self._state_lock:
+            if self._thread is not None and self._thread.is_alive():
+                self._stop.set()
+                self._thread = None
+                return False
+            stop = threading.Event()
+            self._stop = stop
+            self._thread = threading.Thread(
+                target=self._run, args=(stop,), name="ClickEngine", daemon=True
+            )
+            self._thread.start()
+            return True
 
     def _snapshot(self):
-        with self._lock:
+        with self._config_lock:
             return self._interval, self._randomize
 
-    def _wait_until(self, deadline):
-        stop = self._stop
-        while True:
-            if stop.is_set():
-                return False
-            remaining = deadline - time.perf_counter()
-            if remaining <= 0:
-                return True
-            if remaining > 0.002:
-                stop.wait(remaining - 0.001)
-            else:
-                time.sleep(0)
+    def _report(self, message):
+        log.error("%s", message.replace("\n", " "))
+        report = self.report
+        if report is None:
+            return
+        try:
+            report(message)
+        except Exception:
+            log.debug("Could not deliver the engine message", exc_info=True)
 
-    def _run(self):
+    def _run(self, stop):
         try:
             import pyautogui
-        except Exception:
-            self._stop.set()
+        except Exception as error:
+            self._report(
+                "Clicking is unavailable because pyautogui could not be loaded.\n\n"
+                f"{error}"
+            )
             return
 
         pyautogui.PAUSE = 0
@@ -242,24 +502,32 @@ class ClickEngine:
         except Exception:
             timer = None
 
+        failures = 0
         try:
             next_at = time.perf_counter()
-            while not self._stop.is_set():
+            while not stop.is_set():
                 interval, jitter = self._snapshot()
                 if jitter:
                     started = time.perf_counter()
-                    self._click(pyautogui)
+                    clicked = self._click(pyautogui)
                     delay = interval * random.uniform(JITTER_LOW, JITTER_HIGH)
-                    if not self._wait_until(started + delay):
+                    if not self._wait_until(stop, started + delay):
                         break
                 else:
-                    if not self._wait_until(next_at):
+                    if not self._wait_until(stop, next_at):
                         break
-                    self._click(pyautogui)
+                    clicked = self._click(pyautogui)
                     next_at += interval
                     now = time.perf_counter()
                     if next_at < now:
                         next_at = now + interval
+
+                failures = 0 if clicked else failures + 1
+                if failures >= MAX_CLICK_FAILURES:
+                    self._report(
+                        "Clicking stopped because the mouse could not be controlled."
+                    )
+                    break
         finally:
             if timer is not None:
                 try:
@@ -268,11 +536,22 @@ class ClickEngine:
                     pass
 
     @staticmethod
+    def _wait_until(stop, deadline):
+        while not stop.is_set():
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                return True
+            stop.wait(remaining)
+        return False
+
+    @staticmethod
     def _click(pyautogui):
         try:
             pyautogui.click()
+            return True
         except Exception:
-            pass
+            log.warning("A click could not be performed", exc_info=True)
+            return False
 
 
 def build_icon_image(size=64, active=False):
@@ -304,16 +583,74 @@ def apply_dark_title_bar(root):
         dwm = ctypes.windll.dwmapi
         enabled = ctypes.c_int(1)
         for attribute in (20, 19):
-            if dwm.DwmSetWindowAttribute(
-                hwnd, attribute, ctypes.byref(enabled), ctypes.sizeof(enabled)
-            ) == 0:
+            if (
+                dwm.DwmSetWindowAttribute(
+                    hwnd, attribute, ctypes.byref(enabled), ctypes.sizeof(enabled)
+                )
+                == 0
+            ):
                 break
         caption = ctypes.c_int(0x00000000)
-        dwm.DwmSetWindowAttribute(hwnd, 35, ctypes.byref(caption), ctypes.sizeof(caption))
+        dwm.DwmSetWindowAttribute(
+            hwnd, 35, ctypes.byref(caption), ctypes.sizeof(caption)
+        )
         text_color = ctypes.c_int(0x00FFFFFF)
-        dwm.DwmSetWindowAttribute(hwnd, 36, ctypes.byref(text_color), ctypes.sizeof(text_color))
+        dwm.DwmSetWindowAttribute(
+            hwnd, 36, ctypes.byref(text_color), ctypes.sizeof(text_color)
+        )
     except Exception:
-        pass
+        log.debug("The dark title bar is unavailable", exc_info=True)
+
+
+GWL_EXSTYLE = -20
+WS_EX_LAYERED = 0x00080000
+WS_EX_TRANSPARENT = 0x00000020
+LWA_ALPHA = 0x00000002
+
+
+def make_click_through(window):
+    try:
+        window.update_idletasks()
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetParent(window.winfo_id()) or window.winfo_id()
+        user32.GetWindowLongW.argtypes = (ctypes.c_void_p, ctypes.c_int)
+        user32.GetWindowLongW.restype = ctypes.c_long
+        user32.SetWindowLongW.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_long)
+        user32.SetWindowLongW.restype = ctypes.c_long
+        user32.SetLayeredWindowAttributes.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_ubyte,
+            ctypes.c_uint32,
+        )
+        style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED | WS_EX_TRANSPARENT)
+        user32.SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA)
+        return True
+    except Exception:
+        log.debug("Click-through notifications are unavailable", exc_info=True)
+        return False
+
+
+def play_toggle_sound(enabled):
+    if winsound is None:
+        return
+    notes = ((784, 90), (1175, 130)) if enabled else ((988, 90), (587, 150))
+
+    def play():
+        try:
+            for frequency, duration in notes:
+                winsound.Beep(frequency, duration)
+            return
+        except Exception:
+            log.debug("The tone could not be played", exc_info=True)
+        try:
+            sound = winsound.MB_ICONASTERISK if enabled else winsound.MB_ICONHAND
+            winsound.MessageBeep(sound)
+        except Exception:
+            log.debug("The backup notification sound failed", exc_info=True)
+
+    threading.Thread(target=play, name="ToggleSound", daemon=True).start()
 
 
 class AutoClickerApp:
@@ -326,18 +663,18 @@ class AutoClickerApp:
         self._closed = False
         self._after_id = None
         self._hotkey = ""
-        self._hotkey_handle = None
-        self._committing_hotkey = False
         self._hotkey_capturing = False
+        self._hotkey_job = None
+        self._hotkey_poller = HotkeyPoller(self._on_hotkey_press)
+        self._capture_cancel = None
         self._last_toggle = 0.0
+        self._toggle_lock = threading.Lock()
         self._last_valid_ms = DEFAULT_CONFIG["interval_milliseconds"]
-        self._save_job = None
         self._toast = None
         self._toast_job = None
         self._running_state = False
 
         self.icon = None
-        self._tray_thread = None
         self._tray_icons = {}
 
         self._configure_window()
@@ -350,12 +687,14 @@ class AutoClickerApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._apply_running_state(False)
         self._after_id = self.root.after(80, self._pump_queue)
+        self._hotkey_job = self.root.after(HOTKEY_POLL_MS, self._poll_hotkey)
 
     def _configure_window(self):
         self.root.title(APP_NAME)
         self.root.configure(bg=BG)
         self.root.resizable(False, False)
         self.root.option_add("*tearOff", False)
+        self.root.report_callback_exception = report_callback_exception
         self._window_icon = ImageTk.PhotoImage(build_icon_image(64))
         self.root.iconphoto(True, self._window_icon)
 
@@ -452,7 +791,14 @@ class AutoClickerApp:
         fields.columnconfigure(0, weight=1, uniform="interval")
         fields.columnconfigure(1, weight=1, uniform="interval")
 
-        validator = (self.root.register(self._validate_interval_input), "%P")
+        seconds_validator = (
+            self.root.register(self._make_interval_validator(SECONDS_DIGITS)),
+            "%P",
+        )
+        milliseconds_validator = (
+            self.root.register(self._make_interval_validator(MILLISECONDS_DIGITS)),
+            "%P",
+        )
 
         seconds_box = ttk.Frame(fields, style="Root.TFrame")
         seconds_box.grid(row=0, column=0, sticky="ew", padx=(0, 6))
@@ -465,7 +811,7 @@ class AutoClickerApp:
             width=6,
             justify="center",
             validate="key",
-            validatecommand=validator,
+            validatecommand=seconds_validator,
         )
         self.seconds_entry.pack(fill="x", pady=(4, 0))
 
@@ -480,7 +826,7 @@ class AutoClickerApp:
             width=6,
             justify="center",
             validate="key",
-            validatecommand=validator,
+            validatecommand=milliseconds_validator,
         )
         self.ms_entry.pack(fill="x", pady=(4, 0))
 
@@ -495,10 +841,20 @@ class AutoClickerApp:
             hotkey_row,
             textvariable=self.hotkey_var,
             style="Field.TEntry",
-            width=8,
+            width=10,
             justify="center",
         )
         self.hotkey_entry.grid(row=0, column=1, sticky="ew", padx=(12, 0))
+
+        self.status_var = tk.StringVar()
+        self.status_label = ttk.Label(
+            container,
+            textvariable=self.status_var,
+            style="Field.TLabel",
+            justify="left",
+            wraplength=280,
+        )
+        self.status_label.grid(row=3, column=0, sticky="w", pady=(6, 0))
 
         self.randomize_var = tk.BooleanVar()
         self.randomize_check = ttk.Checkbutton(
@@ -509,18 +865,7 @@ class AutoClickerApp:
             cursor="hand2",
             command=self._on_randomize_toggled,
         )
-        self.randomize_check.grid(row=3, column=0, sticky="w", pady=(16, 0))
-
-        self.startup_var = tk.BooleanVar()
-        self.startup_check = ttk.Checkbutton(
-            container,
-            text="Launch on Windows Startup",
-            variable=self.startup_var,
-            style="Switch.TCheckbutton",
-            cursor="hand2",
-            command=self._on_startup_toggled,
-        )
-        self.startup_check.grid(row=4, column=0, sticky="w", pady=(10, 0))
+        self.randomize_check.grid(row=4, column=0, sticky="w", pady=(14, 0))
 
         self.toggle_button = ttk.Button(
             container,
@@ -529,7 +874,7 @@ class AutoClickerApp:
             cursor="hand2",
             command=self._toggle_clicking,
         )
-        self.toggle_button.grid(row=5, column=0, sticky="ew", pady=(18, 0))
+        self.toggle_button.grid(row=5, column=0, sticky="ew", pady=(16, 0))
 
         self.tray_button = ttk.Button(
             container,
@@ -540,21 +885,18 @@ class AutoClickerApp:
         )
         self.tray_button.grid(row=6, column=0, sticky="ew", pady=(8, 0))
 
-        self.seconds_var.trace_add("write", self._on_interval_changed)
-        self.ms_var.trace_add("write", self._on_interval_changed)
-
         for entry in (self.seconds_entry, self.ms_entry):
             entry.bind("<Return>", self._commit_interval)
             entry.bind("<FocusOut>", self._commit_interval)
             entry.bind("<FocusIn>", lambda event: event.widget.select_range(0, "end"))
 
         self.hotkey_entry.bind("<FocusIn>", self._begin_hotkey_capture)
-        self.hotkey_entry.bind("<Button-1>", self._begin_hotkey_capture)
+        self.hotkey_entry.bind("<Button-1>", self._focus_hotkey_entry)
         self.hotkey_entry.bind("<FocusOut>", self._cancel_hotkey_capture)
 
     def _finalize_window(self):
         self.root.update_idletasks()
-        width = max(340, self.root.winfo_reqwidth())
+        width = max(350, self.root.winfo_reqwidth())
         height = self.root.winfo_reqheight()
         x = max(0, (self.root.winfo_screenwidth() - width) // 2)
         y = max(0, (self.root.winfo_screenheight() - height) // 3)
@@ -562,59 +904,27 @@ class AutoClickerApp:
         apply_dark_title_bar(self.root)
 
     def _apply_config(self, config):
-        seconds = _as_int(config.get("interval_seconds"), 0)
-        millis = _as_int(config.get("interval_milliseconds"), 100)
-        total = max(MIN_INTERVAL_MS, min(MAX_INTERVAL_MS, seconds * 1000 + millis))
+        total = (
+            _as_int(config.get("interval_seconds"), 0) * 1000
+            + _as_int(config.get("interval_milliseconds"), DEFAULT_CONFIG["interval_milliseconds"])
+        )
+        total = max(MIN_INTERVAL_MS, min(MAX_INTERVAL_MS, total))
         self._last_valid_ms = total
-        whole_seconds, leftover_ms = divmod(total, 1000)
+        seconds, millis = divmod(total, 1000)
 
-        self.seconds_var.set(str(whole_seconds))
-        self.ms_var.set(str(leftover_ms))
-        self.randomize_var.set(config.get("randomize") is True)
-        self.startup_var.set(config.get("startup") is True)
-        self.engine.configure(total / 1000.0, config.get("randomize") is True)
-
+        self.seconds_var.set(str(seconds))
+        self.ms_var.set(str(millis))
+        randomize = config.get("randomize") is True
+        self.randomize_var.set(randomize)
+        self.engine.configure(total / 1000.0, randomize)
         self._bind_saved_hotkey(config.get("hotkey", DEFAULT_HOTKEY))
 
-    def _persist(self):
-        total = self._current_interval_ms()
-        if total is None:
-            total = self._last_valid_ms
-        total = max(MIN_INTERVAL_MS, min(MAX_INTERVAL_MS, total))
-        seconds, millis = divmod(total, 1000)
-        self.config = {
-            "interval_seconds": seconds,
-            "interval_milliseconds": millis,
-            "hotkey": self._hotkey or DEFAULT_HOTKEY,
-            "randomize": bool(self.randomize_var.get()),
-            "startup": bool(self.startup_var.get()),
-        }
-        save_config(self.config)
-
-    def _schedule_save(self):
-        if self._closed:
-            return
-        self._cancel_save()
-        self._save_job = self.root.after(450, self._save_after_change)
-
-    def _save_after_change(self):
-        self._save_job = None
-        if not self._closed:
-            self._persist()
-
-    def _cancel_save(self):
-        if self._save_job is not None:
-            try:
-                self.root.after_cancel(self._save_job)
-            except Exception:
-                pass
-            self._save_job = None
-
-    @staticmethod
-    def _validate_interval_input(proposed):
-        if proposed == "":
-            return True
-        return proposed.isdigit() and len(proposed) <= 4
+    def _set_status(self, text, error=False):
+        try:
+            self.status_var.set(text)
+            self.status_label.configure(foreground=TEXT if error else MUTED)
+        except tk.TclError:
+            pass
 
     def _current_interval_ms(self):
         try:
@@ -624,102 +934,140 @@ class AutoClickerApp:
             return None
         return seconds * 1000 + millis
 
-    def _on_interval_changed(self, *_args):
-        total = self._current_interval_ms()
-        if total is None:
-            return
-        total = max(MIN_INTERVAL_MS, min(MAX_INTERVAL_MS, total))
-        self._last_valid_ms = total
-        self.engine.configure(total / 1000.0, bool(self.randomize_var.get()))
-        self._schedule_save()
-
-    def _commit_interval(self, _event=None):
+    def _effective_interval_ms(self):
         total = self._current_interval_ms()
         if total is None:
             total = self._last_valid_ms
-        total = max(MIN_INTERVAL_MS, min(MAX_INTERVAL_MS, total))
+        return max(MIN_INTERVAL_MS, min(MAX_INTERVAL_MS, total))
+
+    def _persist(self):
+        total = self._effective_interval_ms()
+        seconds, millis = divmod(total, 1000)
+        self.config = {
+            "interval_seconds": seconds,
+            "interval_milliseconds": millis,
+            "hotkey": self._hotkey or DEFAULT_HOTKEY,
+            "randomize": bool(self.randomize_var.get()),
+        }
+        if not save_config(self.config):
+            self._set_status("Your settings could not be saved to disk.", error=True)
+
+    @staticmethod
+    def _make_interval_validator(max_digits):
+        def validate(proposed):
+            if proposed == "":
+                return True
+            return proposed.isascii() and proposed.isdigit() and len(proposed) <= max_digits
+
+        return validate
+
+    def _commit_interval(self, _event=None):
+        total = self._effective_interval_ms()
         self._last_valid_ms = total
         seconds, millis = divmod(total, 1000)
         self.seconds_var.set(str(seconds))
         self.ms_var.set(str(millis))
         self.engine.configure(total / 1000.0, bool(self.randomize_var.get()))
-        self._cancel_save()
         self._persist()
         return "break"
 
     def _on_randomize_toggled(self):
-        self.engine.configure(self._last_valid_ms / 1000.0, bool(self.randomize_var.get()))
-        self._persist()
-
-    def _on_startup_toggled(self):
-        enabled = bool(self.startup_var.get())
-        if not set_startup(enabled):
-            self.startup_var.set(not enabled)
-            messagebox.showerror(
-                APP_NAME,
-                "The Windows startup entry could not be updated.",
-                parent=self.root,
-            )
+        total = self._effective_interval_ms()
+        self._last_valid_ms = total
+        self.engine.configure(total / 1000.0, bool(self.randomize_var.get()))
         self._persist()
 
     def _bind_hotkey(self, combo):
-        previous = self._hotkey
-        self._unbind_hotkey()
-        try:
-            self._hotkey_handle = keyboard.add_hotkey(
-                combo, self._on_hotkey_press, trigger_on_release=True
-            )
-        except Exception:
-            self._hotkey_handle = None
-            if previous:
-                try:
-                    self._hotkey_handle = keyboard.add_hotkey(
-                        previous, self._on_hotkey_press, trigger_on_release=True
-                    )
-                except Exception:
-                    self._hotkey_handle = None
+        if not self._hotkey_poller.set_combo(combo):
             return False
         self._hotkey = combo
         return True
 
     def _unbind_hotkey(self):
-        handle = self._hotkey_handle
-        if handle is None:
-            return
-        try:
-            keyboard.remove_hotkey(handle)
-        except Exception:
+        job = self._hotkey_job
+        self._hotkey_job = None
+        if job is not None:
             try:
-                keyboard.unhook_all_hotkeys()
+                self.root.after_cancel(job)
             except Exception:
                 pass
-        self._hotkey_handle = None
+        self._hotkey_poller.clear()
+
+    def _hotkey_entry_has_focus(self):
+        try:
+            return self.root.focus_get() is self.hotkey_entry
+        except (KeyError, tk.TclError):
+            return False
+
+    def _poll_hotkey(self):
+        self._hotkey_job = None
+        if self._closed:
+            return
+        if self._hotkey_capturing and not self._hotkey_entry_has_focus():
+            self._cancel_hotkey_capture()
+        try:
+            self._hotkey_poller.poll()
+        except Exception:
+            log.exception("The hotkey check failed")
+        if self._closed:
+            return
+        try:
+            self._hotkey_job = self.root.after(HOTKEY_POLL_MS, self._poll_hotkey)
+        except tk.TclError:
+            self._hotkey_job = None
 
     def _bind_saved_hotkey(self, combo):
         try:
             normalized = normalize_hotkey(combo)
-        except ValueError:
+        except Exception:
             normalized = DEFAULT_HOTKEY
-        if not self._bind_hotkey(normalized):
-            self._bind_hotkey(DEFAULT_HOTKEY)
-        self.hotkey_var.set(format_hotkey(self._hotkey or DEFAULT_HOTKEY))
+        bound = self._bind_hotkey(normalized)
+        if not bound and normalized != DEFAULT_HOTKEY:
+            bound = self._bind_hotkey(DEFAULT_HOTKEY)
+        if bound:
+            self.hotkey_var.set(format_hotkey(self._hotkey))
+            self._set_status(f"Hotkey {format_hotkey(self._hotkey)} is ready.")
+        else:
+            self.hotkey_var.set(format_hotkey(DEFAULT_HOTKEY))
+            self._set_status(
+                "The hotkey could not be set up. Click the hotkey box and choose "
+                "another combination.",
+                error=True,
+            )
+
+    def _focus_hotkey_entry(self, _event=None):
+        try:
+            self.hotkey_entry.focus_set()
+        except tk.TclError:
+            return
+        self._begin_hotkey_capture()
 
     def _begin_hotkey_capture(self, _event=None):
         if self._closed or self._hotkey_capturing:
             return "break"
         self._hotkey_capturing = True
-        self._unbind_hotkey()
-        self.hotkey_var.set("")
-        self.hotkey_entry.configure(state="readonly")
+        self._hotkey_poller.set_suspended(True)
+        cancel = threading.Event()
+        self._capture_cancel = cancel
+        try:
+            self.hotkey_entry.configure(state="readonly")
+        except tk.TclError:
+            self._hotkey_capturing = False
+            self._capture_cancel = None
+            self._hotkey_poller.set_suspended(False)
+            return "break"
+        self.hotkey_var.set("Press keys...")
+        self._set_status("Press the combination you want, or Esc to cancel.")
         threading.Thread(
-            target=self._hotkey_capture_worker, name="HotkeyCapture", daemon=True
+            target=self._capture_worker, args=(cancel,), name="HotkeyCapture", daemon=True
         ).start()
         return "break"
 
-    def _hotkey_capture_worker(self):
+    def _capture_worker(self, cancel):
         try:
-            combo = keyboard.read_hotkey(suppress=False)
+            combo = capture_hotkey(cancel)
         except Exception:
+            log.exception("The hotkey capture failed")
             combo = None
         self._queue.put(("hotkey", combo))
 
@@ -727,67 +1075,89 @@ class AutoClickerApp:
         if not self._hotkey_capturing or self._closed:
             return
         self._hotkey_capturing = False
+        self._hotkey_poller.set_suspended(False)
+        cancel = self._capture_cancel
+        self._capture_cancel = None
+        if cancel is not None:
+            cancel.set()
         try:
             self.hotkey_entry.configure(state="normal")
         except tk.TclError:
             return
         self.hotkey_var.set(format_hotkey(self._hotkey or DEFAULT_HOTKEY))
-        if self._hotkey and self._hotkey_handle is None:
-            self._bind_hotkey(self._hotkey)
+        self._set_status(
+            f"Hotkey {format_hotkey(self._hotkey)} is ready." if self._hotkey else ""
+        )
 
     def _finish_hotkey_capture(self, combo):
         if not self._hotkey_capturing or self._closed:
             return
         self._hotkey_capturing = False
+        self._hotkey_poller.set_suspended(False)
+        self._capture_cancel = None
         try:
             self.hotkey_entry.configure(state="normal")
         except tk.TclError:
             return
 
-        if not combo or str(combo).strip().lower() == "esc":
+        if not combo:
             self.hotkey_var.set(format_hotkey(self._hotkey or DEFAULT_HOTKEY))
-            if self._hotkey and self._hotkey_handle is None:
-                self._bind_hotkey(self._hotkey)
+            self._set_status("Hotkey change cancelled.")
             return
 
         try:
             normalized = normalize_hotkey(combo)
-        except ValueError:
+        except Exception:
             normalized = None
 
         if normalized is None or not self._bind_hotkey(normalized):
             self.hotkey_var.set(format_hotkey(self._hotkey or DEFAULT_HOTKEY))
-            if self._hotkey and self._hotkey_handle is None:
-                self._bind_hotkey(self._hotkey)
+            self._set_status(
+                "That key cannot be used. Try a combination such as Ctrl+Alt+K.",
+                error=True,
+            )
             messagebox.showerror(
                 APP_NAME,
-                "That hotkey could not be registered. Try a different key.",
+                "That key combination cannot be used as a hotkey.\n\n"
+                "Use at least one key that is not a modifier (for example Ctrl+Alt+K).",
                 parent=self.root,
             )
             return
 
         self.hotkey_var.set(format_hotkey(self._hotkey))
+        self._set_status(f"Hotkey {format_hotkey(self._hotkey)} is ready.")
         self._persist()
         self.root.focus_set()
 
-    def _on_hotkey_press(self):
+    def _request_toggle(self):
         if self._closed:
+            return None
+        with self._toggle_lock:
+            now = time.monotonic()
+            if now - self._last_toggle < 0.3:
+                return None
+            self._last_toggle = now
+            return self.engine.toggle()
+
+    def _on_hotkey_press(self):
+        running = self._request_toggle()
+        if running is None:
             return
-        now = time.monotonic()
-        if now - self._last_toggle < 0.3:
-            return
-        self._last_toggle = now
-        running = self.engine.toggle()
-        self._queue.put(("state", running))
+        log.info(
+            "Hotkey %r pressed - clicking %s",
+            self._hotkey,
+            "started" if running else "stopped",
+        )
+        try:
+            self._queue.put(("state", running))
+        except Exception:
+            log.debug("Could not queue the hotkey state", exc_info=True)
 
     def _toggle_clicking(self):
-        if self._closed:
+        self._commit_interval()
+        running = self._request_toggle()
+        if running is None:
             return
-        now = time.monotonic()
-        if now - self._last_toggle < 0.3:
-            return
-        self._last_toggle = now
-        running = self.engine.toggle()
         self._apply_running_state(running, notify=True)
 
     def _build_tray(self):
@@ -800,10 +1170,7 @@ class AutoClickerApp:
             MenuItem("Exit Completely", self._tray_exit),
         )
         self.icon = pystray.Icon(APP_ID, self._tray_icons[False], APP_NAME, menu)
-        self._tray_thread = threading.Thread(
-            target=self.icon.run, name="TrayIcon", daemon=True
-        )
-        self._tray_thread.start()
+        threading.Thread(target=self.icon.run, name="TrayIcon", daemon=True).start()
 
     def _tray_open(self, _icon, _item):
         self._queue.put("open")
@@ -833,38 +1200,56 @@ class AutoClickerApp:
                 icon.icon = self._tray_icons[running]
                 icon.title = f"{APP_NAME} - Clicking" if running else APP_NAME
             except Exception:
-                pass
+                log.debug("Could not update the tray icon", exc_info=True)
         if notify and changed:
             self._show_notification(running)
 
     def _show_notification(self, enabled):
         self._destroy_notification()
+        play_toggle_sound(enabled)
+        title = "AUTOCLICKER ENABLED" if enabled else "AUTOCLICKER DISABLED"
+        hotkey = format_hotkey(self._hotkey or DEFAULT_HOTKEY)
+        hint = f"Press {hotkey} to stop" if enabled else f"Press {hotkey} to start"
+        log.info("Notification: %s", title.title())
         try:
             toast = tk.Toplevel(self.root)
             toast.overrideredirect(True)
-            toast.configure(bg=BG)
+            toast.configure(bg=BORDER)
             toast.attributes("-topmost", True)
-            panel = tk.Frame(toast, bg=SURFACE, padx=20, pady=12)
-            panel.pack(fill="both", expand=True)
-            message = "Autoclicker Enabled" if enabled else "Autoclicker Disabled"
+            panel = tk.Frame(toast, bg=SURFACE, padx=32, pady=18)
+            panel.pack(fill="both", expand=True, padx=1, pady=1)
+            tk.Frame(panel, bg=TEXT, height=4).pack(fill="x")
             tk.Label(
                 panel,
-                text=message,
+                text=title,
                 bg=SURFACE,
                 fg=TEXT,
-                font=("Segoe UI Semibold", 10),
-            ).pack()
+                font=("Segoe UI Semibold", 15),
+            ).pack(pady=(14, 0))
+            tk.Label(
+                panel,
+                text=hint,
+                bg=SURFACE,
+                fg=MUTED,
+                font=("Segoe UI", 10),
+            ).pack(pady=(6, 0))
             toast.update_idletasks()
-            width = max(200, toast.winfo_reqwidth())
+            width = max(340, toast.winfo_reqwidth())
             height = toast.winfo_reqheight()
-            x = max(0, self.root.winfo_screenwidth() - width - 24)
-            y = max(0, self.root.winfo_screenheight() - height - 72)
+            margin = 28
+            x = max(0, self.root.winfo_screenwidth() - width - margin)
+            y = max(0, self.root.winfo_screenheight() - height - 96)
+            pointer_x, pointer_y = self.root.winfo_pointerxy()
+            if x <= pointer_x <= x + width and y <= pointer_y <= y + height:
+                x = margin
             toast.geometry(f"{width}x{height}+{x}+{y}")
             toast.deiconify()
             toast.lift()
+            make_click_through(toast)
             self._toast = toast
-            self._toast_job = self.root.after(1500, self._destroy_notification)
+            self._toast_job = self.root.after(2400, self._destroy_notification)
         except tk.TclError:
+            log.debug("Could not show the notification", exc_info=True)
             self._destroy_notification()
 
     def _destroy_notification(self):
@@ -908,7 +1293,19 @@ class AutoClickerApp:
         self.root.withdraw()
 
     def _on_close(self):
-        self._minimize_to_tray()
+        self._shutdown()
+
+    def report_engine_problem(self, message):
+        self._queue.put(("error", message))
+
+    def _handle_engine_problem(self, message):
+        self._apply_running_state(False)
+        first_line = message.splitlines()[0] if message else "Clicking stopped."
+        self._set_status(first_line, error=True)
+        try:
+            messagebox.showerror(APP_NAME, message, parent=self.root)
+        except tk.TclError:
+            pass
 
     def _pump_queue(self):
         if self._closed:
@@ -921,6 +1318,8 @@ class AutoClickerApp:
                         self._apply_running_state(bool(item[1]), notify=True)
                     elif item[0] == "hotkey":
                         self._finish_hotkey_capture(item[1])
+                    elif item[0] == "error":
+                        self._handle_engine_problem(str(item[1]))
                     continue
                 if item == "open":
                     self._restore_window()
@@ -936,11 +1335,17 @@ class AutoClickerApp:
         if self._closed:
             return
         self._closed = True
+        try:
+            self._commit_interval()
+        except tk.TclError:
+            pass
         self.engine.stop()
-        self._cancel_save()
-        self._persist()
         self._destroy_notification()
         self._unbind_hotkey()
+        cancel = self._capture_cancel
+        self._capture_cancel = None
+        if cancel is not None:
+            cancel.set()
         if self.icon is not None:
             try:
                 self.icon.stop()
@@ -958,11 +1363,7 @@ class AutoClickerApp:
             pass
 
     def dispose(self):
-        self._closed = True
-        self._cancel_save()
-        self.engine.stop()
-        self._destroy_notification()
-        self._unbind_hotkey()
+        self._shutdown()
         if self.icon is not None:
             try:
                 self.icon.stop()
@@ -978,19 +1379,35 @@ class AutoClickerApp:
             pass
 
 
+def end_process_if_needed():
+    lingering = [
+        thread
+        for thread in threading.enumerate()
+        if thread is not threading.current_thread()
+        and thread.is_alive()
+        and not thread.daemon
+    ]
+    if not lingering:
+        return
+    log.info("Forcing exit; lingering threads: %s", [t.name for t in lingering])
+    logging.shutdown()
+    os._exit(0)
+
+
 def main():
+    setup_logging()
     enable_dpi_awareness()
-    config = reconcile_startup(load_config())
+    remove_legacy_startup()
+    config = load_config()
     engine = ClickEngine()
     root = tk.Tk()
-    start_minimized = "--minimized" in sys.argv
-    if start_minimized:
-        root.withdraw()
     app = AutoClickerApp(root, config, engine)
+    engine.report = app.report_engine_problem
     try:
         root.mainloop()
     finally:
         app.dispose()
+    end_process_if_needed()
     return 0
 
 
@@ -1000,8 +1417,11 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except Exception as error:
+        log.exception("The application could not start")
         try:
-            messagebox.showerror(APP_NAME, f"Improved AutoClicker could not start.\n\n{error}")
+            messagebox.showerror(
+                APP_NAME, f"Improved AutoClicker could not start.\n\n{error}"
+            )
         except Exception:
             pass
         raise
